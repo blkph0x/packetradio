@@ -1,19 +1,129 @@
+import os
+import sys
+import tkinter as tk
+import queue
+import threading
+import time
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
-import osmosdr
-import rtl_sdr
-import threading
-import queue
-import time
-import zlib
-from fec import fec_encode, fec_decode
-
+import rtlsdr  # Import the RtlSdr class from the rtlsdr library
+import numpy as np
+from math import log
+librtlsdr_path = "C:\\Users\\Blkph0x\\Desktop\\PacketRadio\\librtlsdr\\"
+os.environ['PATH'] = f"{librtlsdr_path};{os.environ['PATH']}"
 # Predefined key and nonce (example only, generate your own complex key and nonce)
 key = b'\x81\x9f\xfa\xa2\xe7\x33\xd4\xbe\x4e\x5b\x2d\xcb\x22\x2f\x80\x9e' \
       b'\xd1\x2a\x6d\x87\x98\x6a\x0d\x1b\xe1\xc4\xf8\x91\xe3\xbc\x0a\xcd'
 nonce = b'\x75\x3f\x92\xe8\xed\x30\x9f\xfe\xa5\x6e\x0c\x0f'
 
-class my_chacha20_transmitter:
+def fec_encode(data, n, k):
+    generator_poly = get_generator_poly(n, k)
+    padded_data = np.concatenate((data, np.zeros(n - k, dtype=int)))
+    remainder = polynomial_division(padded_data, generator_poly)
+    return np.concatenate((data, remainder))
+
+
+def fec_decode(data, n, k):
+    syndromes = calculate_syndromes(data, n, k)
+    if np.count_nonzero(syndromes) == 0:
+        return data[:k]
+    error_locator_poly = find_error_locator_polynomial(syndromes)
+    error_positions = find_error_positions(error_locator_poly)
+    if len(error_positions) > n - k:
+        raise ValueError("Too many errors to correct")
+    corrected_data = np.copy(data)
+    for position in error_positions:
+        corrected_data[position] ^= 1
+    return corrected_data[:k]
+
+
+def get_generator_poly(n, k):
+    generator = [1]
+    for i in range(n - k):
+        generator = polynomial_multiplication(generator, [1, galois_field_exp(i)])
+    return generator
+
+
+def calculate_syndromes(data, n, k):
+    syndromes = np.zeros(n - k, dtype=int)
+    for i in range(n - k):
+        syndrome = 0
+        for j in range(k):
+            syndrome ^= galois_field_mul(data[j], galois_field_exp(i * j))
+        syndromes[i] = syndrome
+    return syndromes
+
+
+def find_error_locator_polynomial(syndromes):
+    n = len(syndromes) * 2
+    m = len(syndromes)
+    error_locator = np.zeros(m + 1, dtype=int)
+    old_error_locator = np.zeros(m + 1, dtype=int)
+    error_locator[0] = 1
+    old_error_locator[0] = 1
+    for i in range(1, m + 1):
+        discrepancy = syndromes[i - 1]
+        for j in range(1, i):
+            discrepancy ^= galois_field_mul(error_locator[j], syndromes[i - j - 1])
+        if discrepancy != 0:
+            if i > m // 2:
+                error_locator = np.copy(old_error_locator)
+                error_locator = np.roll(error_locator, 1)
+                error_locator[0] = 1
+                for j in range(1, m + 1):
+                    error_locator[j] ^= galois_field_mul(old_error_locator[j], discrepancy)
+            else:
+                error_locator = np.roll(error_locator, 1)
+                error_locator[0] = 1
+                for j in range(1, m + 1):
+                    error_locator[j] ^= galois_field_mul(old_error_locator[j], discrepancy)
+            old_error_locator = np.copy(error_locator)
+    return error_locator
+
+
+def find_error_positions(error_locator_poly):
+    positions = []
+    n = len(error_locator_poly) - 1
+    for i in range(1, n + 1):
+        if error_locator_poly[i] != 0:
+            positions.append(n - i)
+    return positions
+
+
+def polynomial_division(dividend, divisor):
+    dividend_len = len(dividend)
+    divisor_len = len(divisor)
+    quotient = np.zeros(dividend_len, dtype=int)
+    temp_dividend = np.copy(dividend)
+    for i in range(dividend_len - divisor_len + 1):
+        quotient[i] = temp_dividend[i]
+        if quotient[i] != 0:
+            for j in range(1, divisor_len):
+                if divisor[j] != 0:
+                    temp_dividend[i + j] ^= galois_field_mul(divisor[j], quotient[i])
+    remainder = temp_dividend[-(dividend_len - divisor_len + 1):]
+    return remainder
+
+
+def polynomial_multiplication(poly1, poly2):
+    product = np.zeros(len(poly1) + len(poly2) - 1, dtype=int)
+    for i in range(len(poly1)):
+        for j in range(len(poly2)):
+            product[i + j] ^= galois_field_mul(poly1[i], poly2[j])
+    return product
+
+
+def galois_field_exp(power):
+    return 2 ** power
+
+
+def galois_field_mul(a, b):
+    if a == 0 or b == 0:
+        return 0
+    return galois_field_exp((log(a, 2) + log(b, 2)) % 255)
+
+
+class MyChacha20Transmitter:
     def __init__(self, identifier):
         self.samp_rate = 2e6
         self.center_freq = 476.4375e6
@@ -30,10 +140,7 @@ class my_chacha20_transmitter:
         self.cipher = Cipher(algorithm, mode=None, backend=default_backend())
 
         # Transmit signal using HackRF One
-        self.tx_src = osmosdr.source("hackrf=0")
-        self.tx_src.set_sample_rate(self.samp_rate)
-        self.tx_src.set_center_freq(self.center_freq)
-        self.tx_src.set_gain(self.gain)
+        self.tx_src = rtlsdr.RtlSdr()
 
     def transmit(self, msg):
         # Convert text to binary
@@ -92,7 +199,7 @@ class my_chacha20_transmitter:
                 self.tx_src.close()
 
 
-class my_chacha20_receiver:
+class MyChacha20Receiver:
     def __init__(self, identifier):
         self.samp_rate = 2e6
         self.center_freq = 476.4375e6
@@ -108,7 +215,7 @@ class my_chacha20_receiver:
         self.cipher = Cipher(algorithm, mode=None, backend=default_backend())
 
         # Receive signal using RTL-SDR
-        self.rx_src = rtl_sdr.RtlSdr()
+        self.rx_src = rtlsdr.RtlSdr()
 
     def receive(self):
         # Set up the receiver
@@ -139,12 +246,12 @@ class my_chacha20_receiver:
                     decrypted_text = ''.join(chr(byte) for byte in decrypted_data)
 
                     # Print the identifier and received message
-                    print(f"Received from {self.identifier}: {decrypted_text}")
+                    print("Received from {}: {}".format(self.identifier, decrypted_text))
 
     def convert_to_packets(self, samples):
         # Convert received samples to packets
         # (Assuming a simplified conversion for demonstration purposes)
-        return [samples[i:i+self.packet_size] for i in range(0, len(samples), self.packet_size)]
+        return [samples[i:i + self.packet_size] for i in range(0, len(samples), self.packet_size)]
 
     def validate_packet(self, packet):
         # In this case, packet validation is done by checking if the packet has the expected size
@@ -156,27 +263,47 @@ class my_chacha20_receiver:
         receive_thread.daemon = True
         receive_thread.start()
 
-        # Wait for the receive thread to finish
-        try:
-            while True:
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            self.running = False
-            receive_thread.join()
+
+class RadioTunerGUI:
+    def __init__(self, tx_radio, rx_radio):
+        self.tx_radio = tx_radio
+        self.rx_radio = rx_radio
+
+        # Create the main window
+        self.window = tk.Tk()
+        self.window.title("Radio Communication System")
+        self.window.geometry("400x500")
+
+        # Text Input for Transmission
+        self.text_input_label = tk.Label(self.window, text="Enter a message to transmit:")
+        self.text_input_label.pack()
+        self.text_input = tk.Entry(self.window)
+        self.text_input.pack()
+
+        # Transmit Button
+        self.transmit_button = tk.Button(self.window, text="Transmit", command=self.transmit_message)
+        self.transmit_button.pack()
+
+    def transmit_message(self):
+        msg = self.text_input.get()
+        self.tx_radio.transmit(msg)
+
+    def run(self):
+        # Start the receive thread
+        receive_thread = threading.Thread(target=self.rx_radio.start)
+        receive_thread.daemon = True
+        receive_thread.start()
+
+        # Start the GUI main loop
+        self.window.mainloop()
 
 
 if __name__ == "__main__":
     tx_identifier = "Transmitter 1"
     rx_identifier = "Receiver 1"
 
-    tx_radio = my_chacha20_transmitter(tx_identifier)
-    rx_radio = my_chacha20_receiver(rx_identifier)
+    tx_radio = MyChacha20Transmitter(tx_identifier)
+    rx_radio = MyChacha20Receiver(rx_identifier)
 
-    tx_thread = threading.Thread(target=tx_radio.start)
-    rx_thread = threading.Thread(target=rx_radio.start)
-
-    tx_thread.start()
-    rx_thread.start()
-
-    tx_thread.join()
-    rx_thread.join()
+    gui = RadioTunerGUI(tx_radio, rx_radio)
+    gui.run()
